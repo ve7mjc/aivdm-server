@@ -1,0 +1,4 @@
+*.pid
+ecosystem.config.js
+*.log
+venv
