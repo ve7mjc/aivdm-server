@@ -4,17 +4,21 @@
 # Receive AIVDM (RAW NMEA ASCII) messages on UDP and forward them
 # to connected TCP clients
 
+#
+# server (extended socketserver.TCPServer) runs in a thread
+# server spawns a new thread with associated socket in a seperate thread
+# 
+
 import socket
 import socketserver
 import threading
 import queue
 import sys
-#import pickle
-#import select
 import argparse
 
-UDP_RECV_IP = "0.0.0.0"
-TCP_ADDR = '' # all interfaces
+# bind and listen on all interfaces
+UDP_RECV_IP = "0.0.0.0" 
+TCP_ADDR = ''
 
 parser = argparse.ArgumentParser(description='AIVDM Server')
 parser.add_argument('-u','--receivePort', dest='udp_port', type=int, required=True,
@@ -27,12 +31,9 @@ UDP_RECV_PORT = args.udp_port
 TCP_PORT = args.tcp_port
 
 udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udpsock.bind((UDP_RECV_IP, UDP_RECV_PORT))
 
 # for the purpose of announcing that we are receiving UDP data
 received_first_packet = False
-
-print("Listening for UDP AIS AIVDM on %s:%s and listening for TCP client connections on %s:%s" % (UDP_RECV_IP,UDP_RECV_PORT,TCP_ADDR,TCP_PORT))
 
 class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
@@ -49,12 +50,13 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
         super().setup()
         self.server.add_client(self) # track clients in a se
 
-    # we are not handling any receive traffic
-    # exceptions (including connection broken pipes and resets
-    # will result in execution passing through this method and returning
+    # request is handled in this method
+    # when this method returns, the thread and "request" will exit
     def handle(self):
+        
         host, port = self.client_address
         print("client %s connected" % host.rstrip())
+        
         try:
             while not self.requestedToClose:
                 try:
@@ -74,13 +76,15 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
         except Exception as e:
             pass
 
-        # close the underlying socket
-        self.request.close()
+        self.request.close() # close the underlying socket
 
+    # since we are operating multi-threaded, we use a thread-safe
+    # queue to enqueue data to be written to the clients
     def schedule(self, data):
         self.buffer.put(data)
-        #self.buffer.join()
 
+    # request the ceasation of work in the handle method so we
+    # can do a clean shut down; closing of sockets and associated thread
     def close(self):
         self.requestedToClose = True
 
@@ -99,7 +103,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def isShuttingdown(self):
         return self.__shutdown_request
 
-    # Set SO_REUSEADDR socket option prior to binding to help re-use
+    # Set SO_REUSEADDR socket option prior to binding to help re-use of listen port
     def server_bind(self):
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind(self.server_address)
@@ -114,19 +118,43 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def remove_client(self, client):
         self.clients.remove(client)
 
-    def shut(self):
+    def shutdown(self):
         for client in tuple(self.clients):
             client.close()
-
+        super().shutdown()
 
 if __name__ == "__main__":
 
-    server = ThreadedTCPServer((TCP_ADDR, TCP_PORT), ThreadedTCPRequestHandler)
+    # bind UDP listening
+    try:
+        udpsock.bind((UDP_RECV_IP, UDP_RECV_PORT))
+    except OSError as e:
+        if e.errno == 98:
+            print("error: unable to bind udp/%s as it is already in use" % (UDP_RECV_PORT))
+        sys.exit(1)
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+
+    # set up overrode socketserver.TCPServer and listen on TCP port
+    try:
+        server = ThreadedTCPServer((TCP_ADDR, TCP_PORT), ThreadedTCPRequestHandler)
+    except OSError as e:
+        if e.errno == 98:
+            print("error: unable to listen on tcp/%s as it is already in use" % (TCP_PORT))
+        sys.exit(1)
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+
     server_thread = threading.Thread(target=server.serve_forever)
 
     # Exit the server thread when the main thread terminates
     server_thread.daemon = True
+    
     server_thread.start()
+    
+    print("Listening for AIS VDM messages on %s udp/%s and listening for client connections on tcp/%s" % (UDP_RECV_IP,UDP_RECV_PORT,TCP_PORT))
 
     while True:
 
@@ -147,6 +175,5 @@ if __name__ == "__main__":
 
     print("shutting down")
 
-    server.shut()
     server.shutdown()
     server.server_close()
