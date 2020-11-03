@@ -1,20 +1,22 @@
 #!./venv/bin/python3
 
 # AIVDM Server
-# Receive AIVDM (RAW NMEA ASCII) messages on UDP and forward them
-# to connected TCP clients
+# Receive AIVDM (RAW NMEA ASCII) messages on UDP and forward them one or more
+# connected TCP clients
+
+# DATA BACKFILL - Optional
+# Upon connection, clients will receive an initial backfill of traffic over a 
+# specified period of time in the past to aid in quickly populating vessel 
+# positions and static vessel information such as Call signs and Vessel Names.
+#
+# Only the last VDM position messages of type 1,2,3 and VDM voyage or static 
+# data (5 or 24) are sent to significantly reduce network and processing overhead
+#
 
 # Threading
 # server (extended socketserver.TCPServer) runs in a thread
 # server spawns a new thread with associated socket in a seperate thread
 # 
-# future functionality
-# smart backfill - client receivers ~ xx minutes of back fill
-# data deduction opportunities:
-# only last Voyage Data (Message Type 5)
-# do we want to send only the last position of each mmsi?
-# only send ATON once
-# opportunity to FAKE the MMSI/voyage data for ship name -- pull from a known database
 
 import socket
 import socketserver
@@ -23,6 +25,7 @@ import queue
 import sys
 import argparse
 
+# AIS Processing
 from datetime import datetime
 import ais
 import json
@@ -55,11 +58,11 @@ udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # for the purpose of announcing that we are receiving UDP data
 received_first_packet = False
-senders = set()
+senders = set() # track UDP senders
 
 def processVdm(data):
     
-    try: # this method shall not disrupt operation of the application
+    try: # this method must not disrupt overall integrity of the application
         if args.backfill:
             
             try:
