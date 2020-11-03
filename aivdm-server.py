@@ -55,6 +55,7 @@ udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # for the purpose of announcing that we are receiving UDP data
 received_first_packet = False
+senders = set()
 
 def processVdm(data):
     
@@ -232,9 +233,10 @@ if __name__ == "__main__":
             # note: sockets are created in blocking mode by default
             data, addr = udpsock.recvfrom(1024)
 
-            if not received_first_packet and len(data):
+            # announce data arrival from new host
+            if addr not in senders:
                 print("receiving UDP data from %s:%s" % addr)
-                received_first_packet = True
+                senders.add(addr)
 
             server.broadcast(data)
             processVdm(data)
