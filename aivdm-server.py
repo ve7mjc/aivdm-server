@@ -4,10 +4,17 @@
 # Receive AIVDM (RAW NMEA ASCII) messages on UDP and forward them
 # to connected TCP clients
 
-#
+# Threading
 # server (extended socketserver.TCPServer) runs in a thread
 # server spawns a new thread with associated socket in a seperate thread
 # 
+# future functionality
+# smart backfill - client receivers ~ xx minutes of back fill
+# data deduction opportunities:
+# only last Voyage Data (Message Type 5)
+# do we want to send only the last position of each mmsi?
+# only send ATON once
+# opportunity to FAKE the MMSI/voyage data for ship name -- pull from a known database
 
 import socket
 import socketserver
@@ -15,6 +22,11 @@ import threading
 import queue
 import sys
 import argparse
+
+from datetime import datetime
+import ais
+import json
+import traceback
 
 # bind and listen on all interfaces
 UDP_RECV_IP = "0.0.0.0" 
@@ -25,15 +37,66 @@ parser.add_argument('-u','--receivePort', dest='udp_port', type=int, required=Tr
                    help='port to listen for UDP AIVDM messages')
 parser.add_argument('-l','--serverPort', dest='tcp_port', type=int, required=True,
                    help='port to listen for TCP clients to serve AIVDM messages')
+parser.add_argument('-b','--backfill', dest='backfill', type=int,
+                   help='provide new client connections with a smart backfill of traffic over past specified seconds')
 
 args = parser.parse_args()
 UDP_RECV_PORT = args.udp_port
 TCP_PORT = args.tcp_port
 
+# smart backfill
+backfill = False
+if args.backfill:
+    backfill = args.backfill
+lastBackbufferPurge = datetime.timestamp(datetime.now())
+stations = {}
+
 udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # for the purpose of announcing that we are receiving UDP data
 received_first_packet = False
+
+def processVdm(data):
+    
+    try: # this method shall not disrupt operation of the application
+        if args.backfill:
+            
+            try:
+                vdm = ais.decode(data.decode("utf-8").split(',')[5], 0)
+            except ais.DecodeError as e:
+                return
+            
+            mmsi = vdm['mmsi']
+            
+            if mmsi not in stations:
+                stations[mmsi] = {}
+
+            stations[mmsi]['lastHeard'] = datetime.timestamp(datetime.now())
+            
+            if vdm['id'] == 1 or vdm['id'] == 2 or vdm['id'] == 3:
+                stations[mmsi]['lastVdmPos'] = data
+            if vdm['id'] == 5 or vdm['id'] == 24:
+                stations[mmsi]['lastVdmStationData'] = data
+            
+    except Exception as e:
+        print("error processing VDM: %s" % e)
+        traceback.print_exc(file=sys.stdout)
+
+def produceBackfill():
+    
+    buffer = b''
+    curtimestamp = datetime.timestamp(datetime.now())
+    
+    for station in stations:
+        if (stations[station]['lastHeard']+backfill) >= curtimestamp:
+            if 'lastVdmPos' in stations[station]:
+                buffer += stations[station]['lastVdmPos']
+            if 'lastVdmVoy' in stations[station]:
+                buffer += stations[station]['lastVdmStationData']
+        else:
+            del stations[station]
+   
+    return buffer
 
 class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
@@ -55,7 +118,13 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
         
         host, port = self.client_address
-        print("client %s connected" % host.rstrip())
+
+        if backfill:
+            backdata = produceBackfill()
+            print("client %s connected; sending backfill of %s bytes." % (host.rstrip(), len(backdata)))
+            self.request.sendall(backdata)
+        else:
+            print("client %s connected" % host.rstrip())
         
         try:
             while not self.requestedToClose:
@@ -155,17 +224,20 @@ if __name__ == "__main__":
     server_thread.start()
     
     print("Listening for AIS VDM messages on %s udp/%s and listening for client connections on tcp/%s" % (UDP_RECV_IP,UDP_RECV_PORT,TCP_PORT))
+    if backfill: print("Message backfill is enabled and set to %s seconds" % backfill)
 
     while True:
 
         try:
-            data, addr = udpsock.recvfrom(1024) # buffer size is 1024 bytes
+            # note: sockets are created in blocking mode by default
+            data, addr = udpsock.recvfrom(1024)
 
             if not received_first_packet and len(data):
                 print("receiving UDP data from %s:%s" % addr)
                 received_first_packet = True
 
             server.broadcast(data)
+            processVdm(data)
 
         except (KeyboardInterrupt, SystemExit):
             break
@@ -177,3 +249,4 @@ if __name__ == "__main__":
 
     server.shutdown()
     server.server_close()
+    
