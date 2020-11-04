@@ -2,3 +2,5 @@
 *.config.js
 *.log
 venv
+*.dat
+

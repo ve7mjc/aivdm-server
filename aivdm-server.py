@@ -1,7 +1,7 @@
 #!./venv/bin/python3
 
-# AIVDM Server
-# Receive AIVDM (RAW NMEA ASCII) messages on UDP and forward them one or more
+# AIVDM Server - Matthew Currie 2020
+# Receive raw NMEA ASCII AIS AIVDM messages on UDP and forward them one or more
 # connected TCP clients
 
 # DATA BACKFILL - Optional
@@ -24,6 +24,7 @@ import threading
 import queue
 import sys
 import argparse
+import pickle
 
 # AIS Processing
 from datetime import datetime
@@ -34,6 +35,8 @@ import traceback
 # bind and listen on all interfaces
 UDP_RECV_IP = "0.0.0.0" 
 TCP_ADDR = ''
+
+cache_file = "cache.dat"
 
 parser = argparse.ArgumentParser(description='AIVDM Server')
 parser.add_argument('-u','--receivePort', dest='udp_port', type=int, required=True,
@@ -52,13 +55,31 @@ backfill = False
 if args.backfill:
     backfill = args.backfill
 lastBackbufferPurge = datetime.timestamp(datetime.now())
-stations = {}
+cache = {}
 
 udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # for the purpose of announcing that we are receiving UDP data
 received_first_packet = False
 senders = set() # track UDP senders
+    
+# pickle cache to disk
+def saveCache():
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump( cache, f, pickle.HIGHEST_PROTOCOL)
+            print("wrote %s stations in cache to %s" % (len(cache),cache_file))
+    except Exception as e:
+        print("error, unable to write cache to disk: %s" % e)    
+
+# unpickle cache from disk
+def loadCache():
+    try:
+        with open(cache_file, 'rb') as f:
+            cache = pickle.load(f)
+            print("loaded %s stations from %s" % (len(cache),cache_file))
+    except Exception as e:
+        pass
 
 def processVdm(data):
     
@@ -72,16 +93,27 @@ def processVdm(data):
             
             mmsi = vdm['mmsi']
             
-            if mmsi not in stations:
-                stations[mmsi] = {}
+            if mmsi not in cache:
+                cache[mmsi] = {}
 
-            stations[mmsi]['lastHeard'] = datetime.timestamp(datetime.now())
+            cache[mmsi]['lastHeard'] = datetime.timestamp(datetime.now())
             
-            if vdm['id'] == 1 or vdm['id'] == 2 or vdm['id'] == 3:
-                stations[mmsi]['lastVdmPos'] = data
-            if vdm['id'] == 5 or vdm['id'] == 24:
-                stations[mmsi]['lastVdmStationData'] = data
+            # Class A position messages are 1,2,3 
+            # Class B position messages are 18 and 19 (includes some static data fields)
+            if vdm['id'] == 1 or vdm['id'] == 2 or vdm['id'] == 3 or vdm['id'] == 18 or vdm['id'] == 19:
+                cache[mmsi]['lastPos'] = data
+                
+            # Message type 5 Voyage Data - includes Vessel Name, Ship Type, Callsign, Destination, and Dimensions
+            if vdm['id'] == 5:
+                cache[mmsi]['lastVoyageData'] = data
+
+            # Message type 24 Static Data Report - includes Vessel Name, Ship Type, Callsign, and dimensions
+            if vdm['id'] == 24:
+                cache[mmsi]['lastStaticData'] = data
+                
+            # Message type 21 Aids to Navigation (AtoN) Report
             
+
     except Exception as e:
         print("error processing VDM: %s" % e)
         traceback.print_exc(file=sys.stdout)
@@ -91,14 +123,16 @@ def produceBackfill():
     buffer = b''
     curtimestamp = datetime.timestamp(datetime.now())
     
-    for station in stations:
-        if (stations[station]['lastHeard']+backfill) >= curtimestamp:
-            if 'lastVdmPos' in stations[station]:
-                buffer += stations[station]['lastVdmPos']
-            if 'lastVdmVoy' in stations[station]:
-                buffer += stations[station]['lastVdmStationData']
+    for station in cache:
+        if (cache[station]['lastHeard']+backfill) >= curtimestamp:
+            if 'lastPos' in cache[station]:
+                buffer += cache[station]['lastPos']
+            if 'lastVoyageData' in cache[station]:
+                buffer += cache[station]['lastVoyageData']
+            if 'lastStaticData' in cache[station]:
+                buffer += cache[station]['lastStaticData']
         else:
-            del stations[station]
+            del cache[station]
    
     return buffer
 
@@ -142,11 +176,17 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
         # different exception conditions we could log on, etc
         # for now - if we have an exception writing or reading
         # to the socket - we are going to drop this client
-        except (ConnectionResetError, EOFError):
+        except ConnectionResetError as e:
+            print("debug: ConnectionReset %s" % e)
             pass
-        except (BrokenPipeError):
+        except EOFError as e:
+            print("debug: EOFError %s" % e)
+            pass
+        except BrokenPipeError as e:
+            print("debug: BrokenPipe %s" % e)
             pass
         except Exception as e:
+            print("debug: Exception %s" % e)
             pass
 
         self.request.close() # close the underlying socket
@@ -227,6 +267,8 @@ if __name__ == "__main__":
     
     server_thread.start()
     
+    loadCache()
+    
     print("Listening for AIS VDM messages on %s udp/%s and listening for client connections on tcp/%s" % (UDP_RECV_IP,UDP_RECV_PORT,TCP_PORT))
     if backfill: print("Message backfill is enabled and set to %s seconds" % backfill)
 
@@ -251,6 +293,8 @@ if __name__ == "__main__":
             break
 
     print("shutting down")
+    
+    saveCache()
 
     server.shutdown()
     server.server_close()
