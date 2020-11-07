@@ -100,24 +100,28 @@ def processVdm(data):
             # do caching
             
             cache_mutex.acquire()
-            
-            if mmsi not in cache:
-                cache[mmsi] = {}
+            try:
+                if mmsi not in cache:
+                    cache[mmsi] = {}
 
-            cache[mmsi]['lastHeard'] = datetime.timestamp(datetime.now())
-            
-            # Class A position messages are 1,2,3 
-            # Class B position messages are 18 and 19 (includes some static data fields)
-            if vdm['id'] == 1 or vdm['id'] == 2 or vdm['id'] == 3 or vdm['id'] == 18 or vdm['id'] == 19:
-                cache[mmsi]['lastPos'] = data
+                cache[mmsi]['lastHeard'] = datetime.timestamp(datetime.now())
                 
-            # Message type 5 Voyage Data - includes Vessel Name, Ship Type, Callsign, Destination, and Dimensions
-            if vdm['id'] == 5:
-                cache[mmsi]['lastVoyageData'] = data
+                # Class A position messages are 1,2,3 
+                # Class B position messages are 18 and 19 (includes some static data fields)
+                if vdm['id'] == 1 or vdm['id'] == 2 or vdm['id'] == 3 or vdm['id'] == 18 or vdm['id'] == 19:
+                    cache[mmsi]['lastPos'] = data
+                    
+                # Message type 5 Voyage Data - includes Vessel Name, Ship Type, Callsign, Destination, and Dimensions
+                if vdm['id'] == 5:
+                    cache[mmsi]['lastVoyageData'] = data
 
-            # Message type 24 Static Data Report - includes Vessel Name, Ship Type, Callsign, and dimensions
-            if vdm['id'] == 24:
-                cache[mmsi]['lastStaticData'] = data
+                # Message type 24 Static Data Report - includes Vessel Name, Ship Type, Callsign, and dimensions
+                if vdm['id'] == 24:
+                    cache[mmsi]['lastStaticData'] = data
+                
+            except Exception as e:
+                print("error processing VDM: %s" % e)
+                traceback.print_exc(file=sys.stdout)
             
             cache_mutex.release()
             # Message type 21 Aids to Navigation (AtoN) Report
@@ -133,16 +137,20 @@ def produceBackfill():
     curtimestamp = datetime.timestamp(datetime.now())
     
     cache_mutex.acquire()
-    for station in cache:
-        if (cache[station]['lastHeard']+backfill) >= curtimestamp:
-            if 'lastPos' in cache[station]:
-                buffer += cache[station]['lastPos']
-            if 'lastVoyageData' in cache[station]:
-                buffer += cache[station]['lastVoyageData']
-            if 'lastStaticData' in cache[station]:
-                buffer += cache[station]['lastStaticData']
-        else:
-            del cache[station]
+    try:
+        for station in cache:
+            if (cache[station]['lastHeard']+backfill) >= curtimestamp:
+                if 'lastPos' in cache[station]:
+                    buffer += cache[station]['lastPos']
+                if 'lastVoyageData' in cache[station]:
+                    buffer += cache[station]['lastVoyageData']
+                if 'lastStaticData' in cache[station]:
+                    buffer += cache[station]['lastStaticData']
+            else:
+                del cache[station]
+    except Exception as e:
+        print("error processing VDM: %s" % e)
+        traceback.print_exc(file=sys.stdout)   
     cache_mutex.release()
    
     return buffer
