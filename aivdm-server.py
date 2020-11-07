@@ -25,6 +25,7 @@ import queue
 import sys
 import argparse
 import pickle
+from threading import Lock
 
 # AIS Processing
 from datetime import datetime
@@ -55,6 +56,7 @@ backfill = False
 if args.backfill:
     backfill = args.backfill
 lastBackbufferPurge = datetime.timestamp(datetime.now())
+cache_mutex = Lock()
 cache = {}
 
 udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -65,12 +67,14 @@ senders = set() # track UDP senders
     
 # pickle cache to disk
 def saveCache():
+    cache_mutex.acquire()
     try:
         with open(cache_file, 'wb') as f:
             pickle.dump( cache, f, pickle.HIGHEST_PROTOCOL)
             print("wrote %s stations in cache to %s" % (len(cache),cache_file))
     except Exception as e:
-        print("error, unable to write cache to disk: %s" % e)    
+        print("error, unable to write cache to disk: %s" % e)
+    cache_mutex.release()
 
 # unpickle cache from disk
 def loadCache():
@@ -93,6 +97,10 @@ def processVdm(data):
             
             mmsi = vdm['mmsi']
             
+            # do caching
+            
+            cache_mutex.acquire()
+            
             if mmsi not in cache:
                 cache[mmsi] = {}
 
@@ -110,7 +118,8 @@ def processVdm(data):
             # Message type 24 Static Data Report - includes Vessel Name, Ship Type, Callsign, and dimensions
             if vdm['id'] == 24:
                 cache[mmsi]['lastStaticData'] = data
-                
+            
+            cache_mutex.release()
             # Message type 21 Aids to Navigation (AtoN) Report
             
 
@@ -123,6 +132,7 @@ def produceBackfill():
     buffer = b''
     curtimestamp = datetime.timestamp(datetime.now())
     
+    cache_mutex.acquire()
     for station in cache:
         if (cache[station]['lastHeard']+backfill) >= curtimestamp:
             if 'lastPos' in cache[station]:
@@ -133,6 +143,7 @@ def produceBackfill():
                 buffer += cache[station]['lastStaticData']
         else:
             del cache[station]
+    cache_mutex.release()
    
     return buffer
 
