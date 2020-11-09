@@ -25,7 +25,7 @@ import queue
 import sys
 import argparse
 import pickle
-from threading import Lock
+from threading import Lock, Timer
 
 # AIS Processing
 from datetime import datetime
@@ -56,6 +56,7 @@ backfill = False
 if args.backfill:
     backfill = args.backfill
 lastBackbufferPurge = datetime.timestamp(datetime.now())
+
 cache_mutex = Lock()
 cache = {}
 
@@ -64,20 +65,57 @@ udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 # for the purpose of announcing that we are receiving UDP data
 received_first_packet = False
 senders = set() # track UDP senders
+
+cacheDiskWriteRequired = False
+
+# run through list of known stations looking for expired lastHeard
+# save cache to disk if it has changed since last time
+def processCacheTimeouts():
+    
+    curtimestamp = datetime.timestamp(datetime.now())
+    mmsi_deletions = []
+    
+    cache_mutex.acquire(blocking=True)
+    
+    for mmsi in cache:
+        if (cache[mmsi]['lastHeard']+backfill) < curtimestamp:
+            mmsi_deletions.append(mmsi)
+
+    # process deletions
+    deletions = len(mmsi_deletions)
+    for mmsi in mmsi_deletions:
+        del cache[mmsi]
+        
+    cache_mutex.release()
+    
+    if deletions: print("processed %s deletions" % deletions)
+
+    # persist cache to disk
+    if cacheDiskWriteRequired:
+        saveCache()
+
+    # can we call ourselves?
+    t = Timer(60.0, processCacheTimeouts)
+    t.start()
     
 # pickle cache to disk
 def saveCache():
-    cache_mutex.acquire()
+    
+    # make an in-memory copy of the cache as an experiment
+    cache_mutex.acquire(blocking=True)
+    cache_copy = cache
+    cache_mutex.release()
+    
     try:
         with open(cache_file, 'wb') as f:
-            pickle.dump( cache, f, pickle.HIGHEST_PROTOCOL)
-            print("wrote %s stations in cache to %s" % (len(cache),cache_file))
+            pickle.dump( cache_copy, f, pickle.HIGHEST_PROTOCOL)
     except Exception as e:
-        print("error, unable to write cache to disk: %s" % e)
-    cache_mutex.release()
+        print("error writing cache to disk: %s" % e)
+    
 
 # unpickle cache from disk
 def loadCache():
+    global cache # assigned and must be declared global
     try:
         with open(cache_file, 'rb') as f:
             cache = pickle.load(f)
@@ -87,8 +125,10 @@ def loadCache():
 
 def processVdm(data):
     
+    global cacheDiskWriteRequired, cache
+    
     try: # this method must not disrupt overall integrity of the application
-        if args.backfill:
+        if backfill:
             
             try:
                 vdm = ais.decode(data.decode("utf-8").split(',')[5], 0)
@@ -99,7 +139,7 @@ def processVdm(data):
             
             # do caching
             
-            cache_mutex.acquire()
+            cache_mutex.acquire(blocking=True)
             try:
                 if mmsi not in cache:
                     cache[mmsi] = {}
@@ -118,6 +158,8 @@ def processVdm(data):
                 # Message type 24 Static Data Report - includes Vessel Name, Ship Type, Callsign, and dimensions
                 if vdm['id'] == 24:
                     cache[mmsi]['lastStaticData'] = data
+                    
+                cacheDiskWriteRequired = True # mark cache as modified
                 
             except Exception as e:
                 print("error processing VDM: %s" % e)
@@ -126,7 +168,6 @@ def processVdm(data):
             cache_mutex.release()
             # Message type 21 Aids to Navigation (AtoN) Report
             
-
     except Exception as e:
         print("error processing VDM: %s" % e)
         traceback.print_exc(file=sys.stdout)
@@ -134,25 +175,24 @@ def processVdm(data):
 def produceBackfill():
     
     buffer = b''
-    curtimestamp = datetime.timestamp(datetime.now())
     
-    cache_mutex.acquire()
-    try:
-        for station in cache:
-            if (cache[station]['lastHeard']+backfill) >= curtimestamp:
-                if 'lastPos' in cache[station]:
-                    buffer += cache[station]['lastPos']
-                if 'lastVoyageData' in cache[station]:
-                    buffer += cache[station]['lastVoyageData']
-                if 'lastStaticData' in cache[station]:
-                    buffer += cache[station]['lastStaticData']
-            else:
-                del cache[station]
-    except Exception as e:
-        print("error processing VDM: %s" % e)
-        traceback.print_exc(file=sys.stdout)   
+    # make an in-memory copy of the cache as an experiment
+    cache_mutex.acquire(blocking=True)
+    cache_copy = cache
     cache_mutex.release()
-   
+    
+    try:
+        for mmsi in cache_copy:
+            if 'lastPos' in cache_copy[mmsi]:
+                buffer += cache_copy[mmsi]['lastPos']
+            if 'lastVoyageData' in cache_copy[mmsi]:
+                buffer += cache_copy[mmsi]['lastVoyageData']
+            if 'lastStaticData' in cache_copy[mmsi]:
+                buffer += cache_copy[mmsi]['lastStaticData']
+    except Exception as e:
+        print("error producing backfill : %s" % e)
+        traceback.print_exc(file=sys.stdout)
+    
     return buffer
 
 class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
@@ -286,10 +326,12 @@ if __name__ == "__main__":
     
     server_thread.start()
     
-    loadCache()
-    
     print("Listening for AIS VDM messages on %s udp/%s and listening for client connections on tcp/%s" % (UDP_RECV_IP,UDP_RECV_PORT,TCP_PORT))
-    if backfill: print("Message backfill is enabled and set to %s seconds" % backfill)
+
+    if backfill:
+        print("Message backfill is enabled and set to %s seconds" % backfill)
+        loadCache()
+        processCacheTimeouts() # also starts a timer
 
     while True:
 
